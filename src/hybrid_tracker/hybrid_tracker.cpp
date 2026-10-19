@@ -600,6 +600,7 @@ TrackerOutput HybridTrackerImp::update(const FrameContext& ctx)
             const float rw = m_display_box.width, rh = m_display_box.height;
             m_kf->initialize(cv::Vec4d(rx + rw / 2.0, ry + rh / 2.0, rw, rh),
                              ctx.frame_ts_us, ctx.R_cam_at_frame);
+            out.reset_los = true;
         }
         else if (measurement_updated && m_has_raw_tracker_box)
         {
@@ -616,12 +617,12 @@ TrackerOutput HybridTrackerImp::update(const FrameContext& ctx)
         cv::Vec4d realtime;
         if (m_kf->predictOnly(ctx.now_us, ctx.R_cam_now, realtime))
         {
-            cv::Rect2f rt_box(realtime[0] - realtime[2] / 2.0,
+            cv::Rect2d rt_box(realtime[0] - realtime[2] / 2.0,
                               realtime[1] - realtime[3] / 2.0,
                               realtime[2], realtime[3]);
-            rt_box &= cv::Rect2f(0.0f, 0.0f,
-                                 static_cast<float>(frame_w), static_cast<float>(frame_h));
-            out.realtime_box = toBBoxRect(rt_box, true);
+            rt_box &= cv::Rect2d(0.0, 0.0, frame_w, frame_h);
+            out.observation_box = rt_box;
+            out.realtime_box = toBBoxRect(cv::Rect2f(rt_box), rt_box.area() > 0);
         }
     }
 

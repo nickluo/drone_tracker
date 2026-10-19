@@ -1,6 +1,10 @@
 drone_tracker_node:
   ros__parameters:
     use_history_timestamp: false
+    enable_preview: true          # 实机启动即预览；视频文件等待 ON，不提前消费
+    publish_prediction: false     # bbox/LOS 使用采集时刻；true 可按新鲜云台姿态外推
+    los:
+      rate_filter_tau: 0.12       # 秒，0 = 不滤波
     tracker:
       yolo_engine: "balloon_int8.engine"
       nano_backbone: "nanotrackv3_backbone_int8.engine"

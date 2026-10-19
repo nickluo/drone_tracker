@@ -26,11 +26,13 @@ class RotationHistory
 public:
     explicit RotationHistory(size_t max_len = 100) : max_len_(max_len) {}
 
-    /** @brief 追加样本；丢弃乱序/回退时间戳 */
+    /** @brief 去重；时钟回退时清空旧 epoch，与 AirSim gimbal_callback 一致 */
     void push(int64_t ts_us, const cv::Matx33d& R)
     {
-        if (!samples_.empty() && ts_us <= samples_.back().ts_us)
+        if (!samples_.empty() && ts_us == samples_.back().ts_us)
             return;
+        if (!samples_.empty() && ts_us < samples_.back().ts_us)
+            samples_.clear();
         samples_.push_back({ts_us, R});
         while (samples_.size() > max_len_)
             samples_.pop_front();
@@ -62,6 +64,19 @@ public:
             return false;
         out = samples_.back().R;
         return true;
+    }
+
+    RotationSample predictionReference(int64_t frame_ts_us, const cv::Matx33d& frame_rotation,
+                                       int64_t now_us, bool publish_prediction) const
+    {
+        if (publish_prediction && !samples_.empty())
+        {
+            const auto& latest = samples_.back();
+            if (frame_ts_us <= latest.ts_us && latest.ts_us <= now_us &&
+                now_us - latest.ts_us <= 300000)
+                return latest;
+        }
+        return {frame_ts_us, frame_rotation};
     }
 
     bool empty() const { return samples_.empty(); }

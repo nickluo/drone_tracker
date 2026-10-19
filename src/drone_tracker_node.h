@@ -18,11 +18,11 @@
 
 #include "hybrid_tracker.h"
 #include "rotation_history.h"
+#include "target_observation.h"
 #include "mv_camera.h"
 #include "mv_video.h"
 
-// 相机内参（仅用于从 mv_camera.* 参数推导焦距/主点填充跟踪器 KF；
-// 原 DroneEKF 已由跟踪器内置的旋转补偿 KF 取代并删除）
+// 从 mv_camera.* 和实际输出分辨率推导的内参，供旋转补偿 KF 和 LOS 共用。
 struct CameraIntrinsics {
     double fx, fy, px, py;
 };
@@ -56,6 +56,9 @@ private:
         this->declare_parameter<std::string>("save_path", ".");
         this->declare_parameter<bool>("visualized_result", false);
         this->declare_parameter<bool>("use_history_timestamp", false);
+        this->declare_parameter<bool>("publish_prediction", false);
+        this->declare_parameter<bool>("enable_preview", true);
+        this->declare_parameter<double>("los.rate_filter_tau", 0.12);
 
         this->declare_parameter<std::string>("tracker.yolo_engine", "drone_int8.engine");
         this->declare_parameter<std::string>("tracker.nano_backbone", "nanotrackv3_backbone_int8.engine");
@@ -99,16 +102,28 @@ private:
 
     void setup();
     void worker();
+    void start_preview();
+    void stop_preview();
+    void preview_loop();
+    bool read_latest_frame(std::shared_ptr<VPIImageWrapper>& frame);
+    bool decode_frame(const std::shared_ptr<VPIImageWrapper>& buffer, cv::Mat& frame);
+    void publish_image(const cv::Mat& frame, int64_t timestamp_us);
+    void publish_detections(const cv::Rect2d* box, int64_t timestamp_us,
+                            const cv::Matx33d* rotation = nullptr, bool reset_los = false);
 
     void imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg);
+    void mavros_imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg);
     void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg);
 
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr gimbal_sub_;
+    rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr mavros_imu_sub_;
     rclcpp::Subscription<std_msgs::msg::Header>::SharedPtr trigger_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
 
     rclcpp::Publisher<vision_msgs::msg::Detection2D>::SharedPtr detection_pub_;
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr image_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr los_pub_;
+    std::unique_ptr<TargetObservationBuilder> observation_builder_;
     rclcpp::Publisher<std_msgs::msg::Int8>::SharedPtr tracker_state_pub_;
 
     std::unique_ptr<rosbag2_cpp::Writer> rosbag_writer_;
@@ -120,6 +135,8 @@ private:
     int interval_ms_ = 1;
     bool enable_image_output_ = false;
     bool use_history_timestamp_ = false;
+    bool publish_prediction_ = false;
+    bool enable_preview_ = true;
 
     CameraIntrinsics cam_intrinsics_;
 
@@ -129,6 +146,8 @@ private:
     mutable std::mutex gimbal_mtx_;
 
     std::thread worker_thread_;
+    std::thread preview_thread_;
+    std::atomic_bool preview_running_ = false;
     std::atomic_bool running = false;
     int8_t last_tracker_state = -1;
 };

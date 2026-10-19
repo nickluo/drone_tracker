@@ -8,8 +8,10 @@
 using namespace std::chrono_literals;
 
 static const std::string TOPIC_GIMBAL = "/fpv/gimbal";
+static const std::string TOPIC_MAVROS_IMU = "/mavros/imu/data";
 static const std::string TOPIC_ODOM = "/fpv/odom";
 static const std::string TOPIC_TARGET_BBOX = "/fpv/target_bbox";
+static const std::string TOPIC_TARGET_LOS = "/fpv/target_los";
 static const std::string TOPIC_TRACKER_IMAGE = "/fpv/tracker_image";
 static const std::string TOPIC_TRACKER_STATE =  "/fpv/tracker_state";
 static const std::string TOPIC_TRACKER_TRIGGER = "/fpv/tracker_trigger";
@@ -23,6 +25,7 @@ DroneTrackerNode::DroneTrackerNode()
 
 DroneTrackerNode::~DroneTrackerNode()
 {
+    stop_preview();
     stop();
     if (rosbag_writer_)
         rosbag_writer_->close();
@@ -31,9 +34,13 @@ DroneTrackerNode::~DroneTrackerNode()
 void DroneTrackerNode::run()
 {
     if (running) return;
-    running = true;
+    stop_preview();
+    if (worker_thread_.joinable())
+        worker_thread_.join();
     tracker_->reset();
+    observation_builder_->reset();
     last_tracker_state = -1;
+    running = true;
     worker_thread_ = std::thread(&DroneTrackerNode::worker, this);
 }
 
@@ -51,6 +58,8 @@ void DroneTrackerNode::setup()
     // Initialize publishers, subscribers, and services here
     this->get_parameter("visualized_result", enable_image_output_);
     this->get_parameter("use_history_timestamp", use_history_timestamp_);
+    this->get_parameter("publish_prediction", publish_prediction_);
+    this->get_parameter("enable_preview", enable_preview_);
 
     int width_px, height_px, output_width_px, output_height_px, fps;
     float pixel_size_um, focal_length_mm;
@@ -92,6 +101,11 @@ void DroneTrackerNode::setup()
     cam_intrinsics_.fy = focal_length_mm * 1000.0 / pixel_size_um * scale_ratio_h;
     cam_intrinsics_.px = output_width_px / 2.0;
     cam_intrinsics_.py = output_height_px / 2.0;
+    double rate_tau;
+    this->get_parameter("los.rate_filter_tau", rate_tau);
+    observation_builder_ = std::make_unique<TargetObservationBuilder>(
+        cam_intrinsics_.fx, cam_intrinsics_.fy,
+        cv::Point2d(cam_intrinsics_.px, cam_intrinsics_.py), rate_tau);
 
     double fov_deg_w = std::atan2(output_width_px * 0.5, cam_intrinsics_.fx) * 180.0 / M_PI * 2.0;
     double fov_deg_h = std::atan2(output_height_px * 0.5, cam_intrinsics_.fy) * 180.0 / M_PI * 2.0;
@@ -146,14 +160,17 @@ void DroneTrackerNode::setup()
     tracker_ = HybridTracker::CreateInstance(tracker_settings);
     if (!tracker_->init())
     {
-        RCLCPP_ERROR(this->get_logger(), "Failed to initialize HybridTracker");
-        return;
+        throw std::runtime_error("Failed to initialize HybridTracker");
     }
 
     gimbal_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
-        TOPIC_GIMBAL, rclcpp::QoS(rclcpp::KeepLast(1)).best_effort(),
+        TOPIC_GIMBAL, rclcpp::QoS(rclcpp::KeepLast(10)).best_effort(),
         std::bind(&DroneTrackerNode::imu_callback, this, std::placeholders::_1)
     );
+
+    mavros_imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
+        TOPIC_MAVROS_IMU, rclcpp::QoS(rclcpp::KeepLast(100)).best_effort(),
+        std::bind(&DroneTrackerNode::mavros_imu_callback, this, std::placeholders::_1));
 
     odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
         TOPIC_ODOM, 
@@ -162,8 +179,10 @@ void DroneTrackerNode::setup()
 
     detection_pub_ = this->create_publisher<vision_msgs::msg::Detection2D>(
         TOPIC_TARGET_BBOX, 10);
+    los_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>(
+        TOPIC_TARGET_LOS, 10);
     image_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
-        TOPIC_TRACKER_IMAGE, 10);
+        TOPIC_TRACKER_IMAGE, rclcpp::QoS(rclcpp::KeepLast(1)).best_effort());
     tracker_state_pub_ = this->create_publisher<std_msgs::msg::Int8>(
         TOPIC_TRACKER_STATE, 10);
 
@@ -175,6 +194,13 @@ void DroneTrackerNode::setup()
         {
             if (msg->frame_id == "ON" && !running)
             {
+                stop_preview();
+                stop();
+                if (rosbag_writer_)
+                {
+                    rosbag_writer_->close();
+                    rosbag_writer_.reset();
+                }
                 // Generate a timestamped filename prefix
                 std::time_t t = msg->stamp.sec;
                 std::tm* tm_ptr = std::localtime(&t);
@@ -198,36 +224,151 @@ void DroneTrackerNode::setup()
                 {
                     rosbag_writer_ = std::make_unique<rosbag2_cpp::Writer>();
                     rosbag_writer_->open(save_path + "/drone_rosbag_" + filename_ts);
-                    rosbag_writer_->create_topic({TOPIC_ODOM,
-                        "nav_msgs/msg/Odometry",
-                        rmw_get_serialization_format(),
-                        ""
-                    });
+                    rosbag2_storage::TopicMetadata topic;
+                    topic.name = TOPIC_ODOM;
+                    topic.type = "nav_msgs/msg/Odometry";
+                    topic.serialization_format = rmw_get_serialization_format();
+                    rosbag_writer_->create_topic(topic);
+                    topic.name = TOPIC_TARGET_LOS;
+                    topic.type = "geometry_msgs/msg/TwistStamped";
+                    rosbag_writer_->create_topic(topic);
+                    topic.name = TOPIC_MAVROS_IMU;
+                    topic.type = "sensor_msgs/msg/Imu";
+                    rosbag_writer_->create_topic(topic);
                 }
 
                 this->run();
                 status_publisher_->publish(mavros_msgs::msg::StatusText::WARNING, 1, "Drone Tracker Started", true);
             }
-            else if (msg->frame_id == "OFF" && running)
+            else if (msg->frame_id == "OFF" && (running || worker_thread_.joinable()))
             {
                 this->stop();
+                const int64_t stamp_us = std::max(
+                    this->now().nanoseconds() / 1000, observation_builder_->lastStamp() / 1000 + 1);
+                publish_detections(nullptr, stamp_us);
                 if (rosbag_writer_)
                 {
                     rosbag_writer_->close();
                     rosbag_writer_.reset();
                 }
+                start_preview();
                 status_publisher_->publish(mavros_msgs::msg::StatusText::WARNING, 1, "Drone Tracker Stopped", true);
             }
         }
     );
+    start_preview();
+}
+
+void DroneTrackerNode::start_preview()
+{
+    // File replay must remain at its current position until ON.
+    auto camera = std::dynamic_pointer_cast<MVCamera>(mv_camera_);
+    if (!enable_preview_ || !camera || running || preview_running_)
+        return;
+    stop_preview();
+    camera->setup(false);
+    preview_running_ = true;
+    preview_thread_ = std::thread(&DroneTrackerNode::preview_loop, this);
+}
+
+void DroneTrackerNode::stop_preview()
+{
+    preview_running_ = false;
+    if (preview_thread_.joinable())
+        preview_thread_.join();
+}
+
+bool DroneTrackerNode::read_latest_frame(std::shared_ptr<VPIImageWrapper>& frame)
+{
+    if (!mv_camera_->getImageQueue().wait_dequeue_timed(frame, 200ms))
+        return false;
+    std::shared_ptr<VPIImageWrapper> newer;
+    while (mv_camera_->getImageQueue().try_dequeue(newer))
+        frame = std::move(newer);
+    return frame && frame->get();
+}
+
+bool DroneTrackerNode::decode_frame(const std::shared_ptr<VPIImageWrapper>& buffer, cv::Mat& frame)
+{
+    VpiGrayLock lock(buffer);
+    if (!lock.valid() || lock.gray().empty())
+        return false;
+    cv::cvtColor(lock.gray(), frame, cv::COLOR_GRAY2BGR);
+    return true;
+}
+
+void DroneTrackerNode::publish_image(const cv::Mat& frame, int64_t timestamp_us)
+{
+    cv_bridge::CvImage cv_img;
+    cv_img.header.stamp = rclcpp::Time(timestamp_us * 1000);
+    cv_img.header.frame_id = "camera_frame";
+    cv_img.encoding = "bgr8";
+    cv_img.image = frame;
+    auto msg = cv_img.toImageMsg();
+    image_pub_->publish(*msg);
+}
+
+void DroneTrackerNode::publish_detections(const cv::Rect2d* box, int64_t timestamp_us,
+                                         const cv::Matx33d* rotation, bool reset_los)
+{
+    vision_msgs::msg::Detection2D detection;
+    geometry_msgs::msg::TwistStamped los;
+    if (!observation_builder_->build(box, timestamp_us * 1000, rotation, reset_los, detection, los))
+        return;
+    if (box && los.header.frame_id.empty())
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                            "Invalid target LOS or missing /fpv/gimbal camera rotation");
+    if (rosbag_writer_)
+    {
+        rosbag_writer_->write(detection, TOPIC_TARGET_BBOX, detection.header.stamp);
+        rosbag_writer_->write(los, TOPIC_TARGET_LOS, los.header.stamp);
+    }
+    detection_pub_->publish(detection);
+    los_pub_->publish(los);
+}
+
+void DroneTrackerNode::preview_loop()
+{
+    std::shared_ptr<VPIImageWrapper> buffer;
+    while (mv_camera_->getImageQueue().try_dequeue(buffer)) {}
+    bool camera_started = false;
+    while (rclcpp::ok() && preview_running_)
+    {
+        if (!camera_started)
+        {
+            camera_started = mv_camera_->run_async();
+            if (!camera_started)
+            {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                    "Preview camera unavailable; retrying");
+                rclcpp::sleep_for(200ms);
+                continue;
+            }
+        }
+        if (!read_latest_frame(buffer))
+            continue;
+        if (image_pub_->get_subscription_count() == 0)
+            continue;
+        cv::Mat frame;
+        if (decode_frame(buffer, frame))
+            publish_image(frame, buffer->get_timestamps());
+    }
+    buffer.reset();
+    if (camera_started)
+        mv_camera_->stop();
+    preview_running_ = false;
 }
 
 void DroneTrackerNode::worker()
 {
+    std::shared_ptr<VPIImageWrapper> stale;
+    while (mv_camera_->getImageQueue().try_dequeue(stale)) {}
+    stale.reset();
     bool success = mv_camera_->run_async();
     if (!success)
     {
         RCLCPP_ERROR(this->get_logger(), "Failed to open MV Camera ");
+        running = false;
         return;
     }
     RCLCPP_INFO(this->get_logger(), "MV Camera opened successfully");
@@ -242,6 +383,7 @@ void DroneTrackerNode::worker()
     cv::Mat frame;
 
     int count = 0;
+    int empty_reads = 0;
     double avg_time_ms = 0.0;
 
     // Main processing loop
@@ -250,32 +392,37 @@ void DroneTrackerNode::worker()
         rclcpp::Time start_time = this->now();
         std::shared_ptr<VPIImageWrapper> vpi_buffer;
 
-        if (mv_camera_->getImageQueue().wait_dequeue_timed(vpi_buffer, 1s)) {
-            start_time = this->now();
-            // 排空积压只保留最新帧（消费端操作，SPSC 安全）：跟踪器只需要最新
-            // 状态，过载时直接跳过中间帧，避免队列长期满导致生产端丢帧
-            std::shared_ptr<VPIImageWrapper> newer;
-            while (mv_camera_->getImageQueue().try_dequeue(newer))
-                vpi_buffer = std::move(newer);
+        if (!read_latest_frame(vpi_buffer))
+        {
+            if (++empty_reads >= 5)
+            {
+                RCLCPP_WARN(this->get_logger(), "Camera stopped producing frames");
+                break;
+            }
+            continue;
         }
-        else {
-            std::cout << "No frame received from camera." << std::endl;
+        empty_reads = 0;
+        if (!running)
             break;
-        }
+        start_time = this->now();
 
         // 构造帧上下文：帧时刻与当前时刻的相机旋转（无云台数据时保持单位阵）
         FrameContext ctx;
         ctx.frame = vpi_buffer;
         ctx.frame_ts_us = vpi_buffer->get_timestamps();
-        ctx.now_us = this->now().nanoseconds() / 1000;
+        const int64_t now_us = this->now().nanoseconds() / 1000;
+        bool has_camera_rotation;
         {
             std::lock_guard<std::mutex> lock(gimbal_mtx_);
-            cv::Matx33d R;
-            if (gimbal_history_.nearest(ctx.frame_ts_us, R))
-                ctx.R_cam_at_frame = R;
-            if (gimbal_history_.latest(R))
-                ctx.R_cam_now = R;
+            has_camera_rotation = gimbal_history_.nearest(ctx.frame_ts_us, ctx.R_cam_at_frame);
+            const auto reference = gimbal_history_.predictionReference(
+                ctx.frame_ts_us, ctx.R_cam_at_frame, now_us, publish_prediction_);
+            ctx.now_us = reference.ts_us;
+            ctx.R_cam_now = reference.R;
         }
+        if (publish_prediction_ && ctx.now_us == ctx.frame_ts_us)
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                                "No newer fresh /fpv/gimbal pose; using capture-time bbox/LOS");
 
         TrackerOutput out = tracker_->update(ctx);
 
@@ -284,20 +431,9 @@ void DroneTrackerNode::worker()
 
         if (out.consumed)
         {
-            // 发布实时预测框（KF predict_only(now) 外推），空 frame_id 表示无效检测。
-            // 时间戳用外推时刻（与外推框同 epoch，避免下游对已外推的测量二次外推）
-            auto detection_msg = std::make_unique<vision_msgs::msg::Detection2D>();
-            detection_msg->header.stamp = rclcpp::Time(ctx.now_us * 1000);
-            detection_msg->header.frame_id = out.tracking ? "camera_frame" : "";
-            detection_msg->bbox.center.position.x = out.realtime_box.cx;
-            detection_msg->bbox.center.position.y = out.realtime_box.cy;
-            detection_msg->bbox.size_x = out.realtime_box.width;
-            detection_msg->bbox.size_y = out.realtime_box.height;
-            if (rosbag_writer_)
-            {
-                rosbag_writer_->write(*detection_msg, TOPIC_TARGET_BBOX, detection_msg->header.stamp);
-            }
-            detection_pub_->publish(std::move(detection_msg));
+            const bool valid = out.tracking && out.observation_box.area() > 0;
+            publish_detections(valid ? &out.observation_box : nullptr, ctx.now_us,
+                               has_camera_rotation ? &ctx.R_cam_now : nullptr, out.reset_los);
 
             // 状态仅变化时发布
             int8_t tracker_state_int = static_cast<int8_t>(out.state);
@@ -313,18 +449,14 @@ void DroneTrackerNode::worker()
             }
         }
 
-        if (enable_image_output_ && out.consumed)
+        if (enable_image_output_ && out.consumed &&
+            (image_pub_->get_subscription_count() > 0 || rosbag_writer_))
         {
             const cv::Scalar color = cv::Scalar((out.color & 0xFF), ((out.color >> 8) & 0xFF), ((out.color >> 16) & 0xFF));
             const int64_t frame_ts = ctx.frame_ts_us;
 
-            // Convert VPI image to OpenCV Mat
-            cv::Mat mono;
-            VPIImageData image_data;
-            vpiImageLockData(vpi_buffer->get(), VPI_LOCK_READ, VPI_IMAGE_BUFFER_HOST_PITCH_LINEAR, &image_data);
-            vpiImageDataExportOpenCVMat(image_data, &mono);
-            vpiImageUnlock(vpi_buffer->get());
-            cv::merge(std::vector<cv::Mat>{mono, mono, mono}, frame);
+            if (!decode_frame(vpi_buffer, frame))
+                continue;
 
             if (out.display_box.is_valid)
             {
@@ -351,18 +483,7 @@ void DroneTrackerNode::worker()
             cv::putText(frame, "Cost: " + std::to_string(int(cost_ms)) + " ms", cv::Point(20, 40), cv::FONT_HERSHEY_SIMPLEX, 1, color, 2);
             cv::putText(frame, out.info, cv::Point(20, 80), cv::FONT_HERSHEY_SIMPLEX, 1, color, 2);
 
-            cv_bridge::CvImage cv_img;
-            cv_img.header.stamp = rclcpp::Time(frame_ts*1000);
-            cv_img.header.frame_id = "camera_frame";
-            cv_img.encoding = "bgr8";
-            cv_img.image = frame;
-            auto img_msg = std::make_unique<sensor_msgs::msg::Image>();
-            cv_img.toImageMsg(*img_msg);
-            if (rosbag_writer_)
-            {
-                rosbag_writer_->write(*img_msg, TOPIC_TRACKER_IMAGE, rclcpp::Time(frame_ts*1000));
-            }
-            image_pub_->publish(std::move(img_msg));
+            publish_image(frame, frame_ts);
 
             elapsed = this->now() - start_time;
             cost_ms = elapsed.seconds() * 1000;
@@ -381,6 +502,7 @@ void DroneTrackerNode::worker()
     std::cout << "Average tracking time per frame: " << std::fixed << std::setprecision(2) << avg_time_ms << " ms" << std::endl;
 
     mv_camera_->stop();
+    running = false;
 }
 
 void DroneTrackerNode::odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg)
@@ -388,6 +510,14 @@ void DroneTrackerNode::odom_callback(const nav_msgs::msg::Odometry::SharedPtr ms
     if (rosbag_writer_)
     {
         rosbag_writer_->write(*msg, TOPIC_ODOM, rclcpp::Time(msg->header.stamp));
+    }
+}
+
+void DroneTrackerNode::mavros_imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg)
+{
+    if (rosbag_writer_)
+    {
+        rosbag_writer_->write(*msg, TOPIC_MAVROS_IMU, rclcpp::Time(msg->header.stamp));
     }
 }
 
@@ -404,6 +534,8 @@ void DroneTrackerNode::imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg)
 
     // 四元数 -> 旋转矩阵（与 Eigen toRotationMatrix 同式），归一化后按行列展开
     const double norm = std::sqrt(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
+    if (!std::isfinite(norm) || norm <= 0.0)
+        return;
     const double w = q.w / norm, x = q.x / norm, y = q.y / norm, z = q.z / norm;
     const cv::Matx33d R(
         1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - w * z), 2.0 * (x * z + w * y),

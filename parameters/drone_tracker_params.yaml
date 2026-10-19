@@ -4,6 +4,10 @@ drone_tracker_node:
     save_path: "/home/dg/Videos/"
     visualized_result: true
     use_history_timestamp: false
+    enable_preview: true          # 实机启动即预览；ON 时切换标注图像，OFF 后恢复
+    publish_prediction: false     # 默认采集时刻；true 使用最新且不超过 0.3s 的云台姿态
+    los:
+      rate_filter_tau: 0.12       # LOS 角速度低通时间常数（秒），0 = 不滤波
     tracker:
       yolo_engine: "drone_int8.engine"
       nano_backbone: "nanotrackv3_backbone_int8.engine"

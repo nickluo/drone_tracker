@@ -67,7 +67,7 @@ struct FrameContext
 {
     std::shared_ptr<VPIImageWrapper> frame;
     int64_t frame_ts_us = 0;    // 帧采集时刻（系统时钟，us）
-    int64_t now_us = 0;         // 处理/外推时刻（发布用）
+    int64_t now_us = 0;         // 发布参考时刻：采集时刻或最新的新鲜云台姿态时刻
     cv::Matx33d R_cam_at_frame = cv::Matx33d::eye(); // 帧时刻相机旋转（无云台数据时为单位阵）
     cv::Matx33d R_cam_now = cv::Matx33d::eye();      // 当前相机旋转
 };
@@ -78,7 +78,9 @@ struct TrackerOutput
     bool consumed = false;      // false: 重复帧/时间倒退/持续跳变提前返回（跳过本帧发布）
     bool tracking = false;
     BBoxRect display_box{};     // 整数显示框（跟踪器结果，用于可视化）
-    BBoxRect realtime_box{};    // KF predict_only(now) 实时预测框（发布这个）
+    BBoxRect realtime_box{};    // KF 在发布参考时刻的整数显示框
+    cv::Rect2d observation_box{}; // 同一预测的浮点框，保留亚像素精度用于 bbox/LOS
+    bool reset_los = false;     // YOLO 重锚定清空旧 LOS 角速度
     TrackerState state = TrackerState::Detecting;
     std::string info;           // 状态文本（可视化/StatusText）
     uint32_t color = 0;         // 显示颜色 RGB 打包

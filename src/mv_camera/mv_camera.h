@@ -30,8 +30,8 @@ public:
     virtual bool stop() override;
     virtual bool is_running() const override { return initialized_ && is_running_.load(); }
     virtual bool get_image_size(int &width, int &height) const override {
-        width = width_;
-        height = height_;
+        width = displayWidth_;
+        height = displayHeight_;
         return true;
     }
 private:

@@ -19,6 +19,7 @@ find_package(ament_cmake REQUIRED)
 find_package(ament_index_cpp REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
 find_package(vision_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
@@ -49,6 +50,7 @@ ament_target_dependencies(drone_tracker_node
     ament_index_cpp
     rclcpp
     sensor_msgs
+    geometry_msgs
     nav_msgs
     vision_msgs
     cv_bridge
@@ -81,5 +83,18 @@ install(DIRECTORY
   parameters
   DESTINATION share/${PROJECT_NAME}/
 )
+
+include(CTest)
+if(BUILD_TESTING OR DRONE_TRACKER_BUILD_TESTS)
+    enable_testing()
+    add_executable(target_los_tests
+        src/hybrid_tracker/tests/test_target_los.cpp
+        src/hybrid_tracker/rotation_kf.cpp
+    )
+    target_include_directories(target_los_tests PRIVATE ${OpenCV_INCLUDE_DIRS})
+    target_link_libraries(target_los_tests ${OpenCV_LIBS})
+    ament_target_dependencies(target_los_tests geometry_msgs vision_msgs)
+    add_test(NAME target_los_tests COMMAND target_los_tests)
+endif()
 
 ament_package()

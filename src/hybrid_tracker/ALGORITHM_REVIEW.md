@@ -1,5 +1,58 @@
 # 混合跟踪器算法综述 (Hybrid Tracker Algorithm Review)
 
+## 节点接口更新（同步 AirSim 最近三次提交）
+
+对应 `airsim_tracker` 提交 `1052e1f`、`ab115d8`、`a6420b2`。
+以下描述节点当前接口；后面的旧版算法综述不作为参数默认值依据。
+
+- `/fpv/target_bbox`（`vision_msgs/Detection2D`）和 `/fpv/target_los`
+  （`geometry_msgs/TwistStamped`）成对发布，使用相同时间戳。
+  bbox 保留 KF 浮点精度，并保持实机原有的图像边界裁剪。
+- LOS 的 `header.frame_id = camera_flu`；`twist.linear.y/z` 分别为俯仰角
+  （向下正）/偏航角（向左正），单位 rad；`twist.angular.y/z` 为对应角速度，单位 rad/s。
+  角速度先将上一帧视线及滤波后的速度旋转到当前相机系，再差分并低通，消除云台自转影响。
+  其余分量为零。目标丢失或 OFF 后两条消息的 `frame_id` 均为空；
+  缺失/非法相机姿态时只将 LOS 标为无效，保留 bbox。
+- 默认 `publish_prediction: false`，bbox/LOS 使用图像采集时刻。
+  设为 `true` 时，只有最新 `/fpv/gimbal` 姿态位于采集时刻和当前时刻之间、
+  且距当前不超过 0.3 秒，才预测到该姿态的时间戳；否则回退采集时刻。
+  重复或倒序的发布时刻会被跳过，避免下游重复处理同一预测。
+- `los.rate_filter_tau: 0.12` 是角速度低通时间常数（秒），`0` 关闭低通。
+  采样间隙超过 0.3 秒、目标丢失、YOLO 重锚定或重新 ON 都会清零旧角速度。
+  相机内参按实际输出分辨率缩放，分别使用 fx/fy，支持非等比缩放。
+- 实机默认 `enable_preview: true`：启动后在 `/fpv/tracker_image` 发布原始预览，
+  ON 前先完整停止预览线程，再交给跟踪线程发布标注图像；OFF 后恢复预览。
+  两者共用相机且始终只有一个队列消费者。预览不录制，也不提前消费视频文件回放。
+  跟踪阶段继续由 `visualized_result` 控制图像输出；无人订阅且无需录制时跳过图像转换。
+  图像 QoS 为 best-effort、depth 1，订阅端应使用兼容的 best-effort QoS。
+- 开启 `need_save` 并触发 ON 后，rosbag 还会录制 `/mavros/imu/data`
+  （`sensor_msgs/Imu`）。订阅使用 best-effort、depth 100，保留完整原始消息，
+  bag 写入时间使用消息的 `header.stamp`；OFF 关闭 bag 后不再写入。
+  该订阅仅用于录制，与 `/fpv/gimbal` 的相机旋转补偿互不影响。
+- 云台姿态仍由外部桥接节点通过 `/fpv/gimbal` 提供，跟踪节点不控制云台。
+  Orin Nano 的相机采集、VPI、TensorRT 模型和实机检测阈值保持原有配置；
+  AirSim 的 RPC/场景配置不适用于实机，未移植。
+
+两个 launch 文件均支持以下参数（原有其他参数继续可用）：
+
+```bash
+ros2 launch drone_tracker drone_tracker.launch.py publish_prediction:=false enable_preview:=true los_rate_filter_tau:=0.12
+ros2 launch drone_tracker balloon_tracker.launch.py publish_prediction:=true
+```
+
+回归测试位于 `tests/test_target_los.cpp`，覆盖相机复合旋转、运动目标、Python 参考值、
+KF/LOS 组合、时间戳去重、复位和 ROS 消息配对；测试本身仅依赖主机 OpenCV 和 ROS 消息头，
+无需 GPU 或模型。Jetson 上通过项目 CMake/CTest 构建运行：
+
+```bash
+colcon build --packages-select drone_tracker --cmake-args -DBUILD_TESTING=ON
+colcon test --packages-select drone_tracker --ctest-args -R target_los_tests --output-on-failure
+colcon test-result --verbose
+```
+
+硬件验收：用 best-effort 订阅 `/fpv/tracker_image`，确认启动即预览；连续执行 ON/OFF/ON，
+确认标注与原图切换且录像只覆盖 ON 区间；检查 bbox/LOS 时间戳和上述有效性约定。
+
 ## 1. 简介
 `HybridTracker` 是一个专为无人机应用设计的鲁棒目标跟踪系统。它结合了三种不同算法的优势，以实现高性能跟踪：
 1.  **YOLOv8**: 基于深度学习的目标检测器，用于目标初始化和重识别。
